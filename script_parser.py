@@ -103,7 +103,12 @@ def parse_evt(decrypted):
             break
         seg_id = read_u32_le(decrypted, off)
         count = read_u32_le(decrypted, off + 4)
-        all_entries.append({'offset': off, 'id': seg_id, 'count': count})
+        record_size = read_u32_le(decrypted, off + 8)
+        total_size = read_u32_le(decrypted, off + 12)
+        all_entries.append({
+            'offset': off, 'id': seg_id, 'count': count,
+            'record_size': record_size, 'total_size': total_size,
+        })
 
     all_seg_ids = sorted(set(e['id'] for e in all_entries if e['id'] != 0))
 
@@ -122,139 +127,86 @@ def parse_evt(decrypted):
         seg_id = seg['id']
         count = seg['count']
 
-        if seg_id == 0x0442:
-            continue
-
-        menu_offset = seg_id
-        entries = []
-        for i in range(count):
-            entry_off = menu_offset + i * 4
-            if entry_off + 4 > len(decrypted):
-                break
-            inst_off = read_u32_le(decrypted, entry_off)
-            entries.append(inst_off)
-
         idx_in_sorted = bisect.bisect_left(all_seg_ids, seg_id)
         if idx_in_sorted + 1 < len(all_seg_ids):
             next_seg_start = all_seg_ids[idx_in_sorted + 1]
         else:
             next_seg_start = len(decrypted)
 
-        for i, inst_off in enumerate(entries):
-            if i + 1 < len(entries):
-                end_off = entries[i + 1]
-            else:
-                end_off = next_seg_start
+        if seg_id == 0x0442:
+            record_size = seg.get('record_size', 0)
+            total_size = seg.get('total_size', 0)
+            if record_size == 0 and total_size > 0 and count > 0:
+                record_size = total_size // count
+            if count == 1 and record_size == 0:
+                record_size = total_size
 
-            if inst_off >= len(decrypted):
-                inst_hex = '[超出文件范围]'
-                inst_len = 0
-            else:
-                actual_end = min(end_off, len(decrypted))
-                inst_bytes = decrypted[inst_off:actual_end]
-                inst_hex = ' '.join('{:02X}'.format(b) for b in inst_bytes)
-                inst_len = len(inst_bytes)
+            menu_offset = seg_id
+            for i in range(count):
+                rec_off = seg_id + i * record_size
+                if i + 1 < count:
+                    end_off = seg_id + (i + 1) * record_size
+                else:
+                    end_off = min(seg_id + total_size, next_seg_start) if total_size > 0 else next_seg_start
 
-            all_instructions.append({
-                'seg_id': '0x{:04X}'.format(seg_id),
-                'seg_offset': '0x{:04X}'.format(menu_offset),
-                'inst_index': i,
-                'inst_offset': '0x{:04X}'.format(inst_off),
-                'end_offset': '0x{:04X}'.format(end_off),
-                'length': inst_len,
-                'hex': inst_hex,
-            })
+                if rec_off >= len(decrypted):
+                    inst_hex = '[超出文件范围]'
+                    inst_len = 0
+                else:
+                    actual_end = min(end_off, len(decrypted))
+                    inst_bytes = decrypted[rec_off:actual_end]
+                    if all(b == 0 for b in inst_bytes):
+                        continue
+                    inst_hex = ' '.join('{:02X}'.format(b) for b in inst_bytes)
+                    inst_len = len(inst_bytes)
+
+                all_instructions.append({
+                    'seg_id': '0x{:04X}'.format(seg_id),
+                    'seg_offset': '0x{:04X}'.format(menu_offset),
+                    'inst_index': i,
+                    'inst_offset': '0x{:04X}'.format(rec_off),
+                    'end_offset': '0x{:04X}'.format(end_off),
+                    'length': inst_len,
+                    'hex': inst_hex,
+                    'is_first_seg': True,
+                })
+        else:
+            menu_offset = seg_id
+            entries = []
+            for i in range(count):
+                entry_off = menu_offset + i * 4
+                if entry_off + 4 > len(decrypted):
+                    break
+                inst_off = read_u32_le(decrypted, entry_off)
+                entries.append(inst_off)
+
+            for i, inst_off in enumerate(entries):
+                if i + 1 < len(entries):
+                    end_off = entries[i + 1]
+                else:
+                    end_off = next_seg_start
+
+                if inst_off >= len(decrypted):
+                    inst_hex = '[超出文件范围]'
+                    inst_len = 0
+                else:
+                    actual_end = min(end_off, len(decrypted))
+                    inst_bytes = decrypted[inst_off:actual_end]
+                    inst_hex = ' '.join('{:02X}'.format(b) for b in inst_bytes)
+                    inst_len = len(inst_bytes)
+
+                all_instructions.append({
+                    'seg_id': '0x{:04X}'.format(seg_id),
+                    'seg_offset': '0x{:04X}'.format(menu_offset),
+                    'inst_index': i,
+                    'inst_offset': '0x{:04X}'.format(inst_off),
+                    'end_offset': '0x{:04X}'.format(end_off),
+                    'length': inst_len,
+                    'hex': inst_hex,
+                    'is_first_seg': False,
+                })
 
     return all_entries, valid_entries, all_instructions
-
-
-def save_evt_excel(all_entries, valid_entries, all_instructions, output_path):
-    wb = Workbook()
-
-    ws1 = wb.active
-    ws1.title = '一级菜单'
-
-    valid_ids = {e['id'] for e in valid_entries}
-    headers1 = ['序号', '一级指令段ID', '一级菜单Offset', '指令数量', '是否跳过', '备注']
-    apply_header(ws1, headers1)
-
-    for row_idx, entry in enumerate(all_entries, 1):
-        seg_id = entry['id']
-        count = entry['count']
-        is_skipped = (count == 0) or (seg_id == 0x0442) or (seg_id not in valid_ids)
-        note = ''
-        if seg_id == 0x0442:
-            note = '第一段，默认跳过'
-        elif count == 0:
-            note = '无指令(count=0)'
-        elif seg_id not in valid_ids:
-            note = '重复段ID'
-
-        values = [
-            row_idx,
-            '0x{:04X}'.format(seg_id),
-            '0x{:04X}'.format(entry['offset']),
-            count,
-            '是' if is_skipped else '否',
-            note,
-        ]
-        for col, v in enumerate(values, 1):
-            cell = ws1.cell(row=row_idx + 1, column=col, value=v)
-            cell.alignment = header_align
-            cell.border = thin_border
-            if is_skipped:
-                cell.fill = skip_fill
-
-    set_col_widths(ws1, [6, 18, 18, 10, 10, 20])
-    ws1.freeze_panes = 'A2'
-
-    ws2 = wb.create_sheet('指令明细')
-    headers2 = ['序号', '所属一级段ID', '二级菜单Offset', '指令序号',
-                '指令Offset', '结束Offset', '长度(字节)', '指令内容(HEX)',
-                '具体指令', '指令作用']
-    apply_header(ws2, headers2)
-
-    current_seg = None
-    for row_idx, inst in enumerate(all_instructions, 1):
-        is_new_seg = inst['seg_id'] != current_seg
-        current_seg = inst['seg_id']
-
-        is_last = False
-        if row_idx < len(all_instructions):
-            next_inst = all_instructions[row_idx]
-            if next_inst['seg_id'] != current_seg:
-                is_last = True
-        else:
-            is_last = True
-
-        prefix = get_instr_prefix(inst['hex']) if inst['hex'] != '[超出文件范围]' else ''
-        func = INSTR_FUNC_MAP.get(prefix, '') if prefix else ''
-
-        values = [
-            row_idx,
-            inst['seg_id'] if is_new_seg else '',
-            inst['seg_offset'] if is_new_seg else '',
-            inst['inst_index'],
-            inst['inst_offset'],
-            inst['end_offset'],
-            inst['length'],
-            inst['hex'],
-            prefix,
-            func,
-        ]
-        for col, v in enumerate(values, 1):
-            cell = ws2.cell(row=row_idx + 1, column=col, value=v)
-            cell.alignment = cell_align
-            cell.border = thin_border
-            if is_new_seg:
-                cell.fill = seg_fill
-            elif is_last:
-                cell.fill = last_fill
-
-    set_col_widths(ws2, [6, 16, 18, 10, 14, 14, 12, 80, 14, 16])
-    ws2.freeze_panes = 'A2'
-
-    wb.save(output_path)
 
 
 # ── MSG 解析 ──────────────────────────────────────────
@@ -337,90 +289,6 @@ def parse_msg(decrypted):
             })
 
     return all_entries, valid_entries, all_instructions
-
-
-def save_msg_excel(all_entries, valid_entries, all_instructions, output_path):
-    wb = Workbook()
-
-    ws1 = wb.active
-    ws1.title = '一级菜单'
-
-    valid_ids = {e['id'] for e in valid_entries}
-    headers1 = ['序号', '一级指令段ID', '一级菜单Offset', '指令数量', '是否跳过', '备注']
-    apply_header(ws1, headers1)
-
-    for row_idx, entry in enumerate(all_entries, 1):
-        seg_id = entry['id']
-        count = entry['count']
-        is_skipped = (count == 0) or (seg_id == 0) or (seg_id not in valid_ids)
-        note = ''
-        if count == 0:
-            note = '无指令(count=0)'
-        elif seg_id == 0:
-            note = '空段ID'
-        elif seg_id not in valid_ids:
-            note = '重复段ID'
-
-        values = [
-            row_idx,
-            '0x{:04X}'.format(seg_id),
-            '0x{:04X}'.format(entry['offset']),
-            count,
-            '是' if is_skipped else '否',
-            note,
-        ]
-        for col, v in enumerate(values, 1):
-            cell = ws1.cell(row=row_idx + 1, column=col, value=v)
-            cell.alignment = header_align
-            cell.border = thin_border
-            if is_skipped:
-                cell.fill = skip_fill
-
-    set_col_widths(ws1, [6, 18, 18, 10, 10, 20])
-    ws1.freeze_panes = 'A2'
-
-    ws2 = wb.create_sheet('指令明细')
-    headers2 = ['序号', '所属一级段ID', '二级菜单Offset', '指令序号',
-                '指令Offset', '结束Offset', '长度(字节)', '指令内容(HEX)', '文字内容(Big5)']
-    apply_header(ws2, headers2)
-
-    current_seg = None
-    for row_idx, inst in enumerate(all_instructions, 1):
-        is_new_seg = inst['seg_id'] != current_seg
-        current_seg = inst['seg_id']
-
-        is_last = False
-        if row_idx < len(all_instructions):
-            next_inst = all_instructions[row_idx]
-            if next_inst['seg_id'] != current_seg:
-                is_last = True
-        else:
-            is_last = True
-
-        values = [
-            row_idx,
-            inst['seg_id'] if is_new_seg else '',
-            inst['seg_offset'] if is_new_seg else '',
-            inst['inst_index'],
-            inst['inst_offset'],
-            inst['end_offset'],
-            inst['length'],
-            inst['hex'],
-            inst['text'],
-        ]
-        for col, v in enumerate(values, 1):
-            cell = ws2.cell(row=row_idx + 1, column=col, value=v)
-            cell.alignment = cell_align
-            cell.border = thin_border
-            if is_new_seg:
-                cell.fill = seg_fill
-            elif is_last:
-                cell.fill = last_fill
-
-    set_col_widths(ws2, [6, 16, 18, 10, 14, 14, 12, 60, 60])
-    ws2.freeze_panes = 'A2'
-
-    wb.save(output_path)
 
 
 # ── DAT 解析 ──────────────────────────────────────────
@@ -555,101 +423,9 @@ def parse_dat(decrypted):
     return all_entries, valid_entries, all_records
 
 
-def save_dat_excel(all_entries, valid_entries, all_records, output_path):
-    wb = Workbook()
-
-    ws1 = wb.active
-    ws1.title = '一级菜单'
-
-    valid_ids = {e['seg_id'] for e in valid_entries}
-    headers1 = ['序号', '数据段ID', '菜单Offset', '记录数', '记录大小(字节)', '总大小(字节)', '是否跳过', '备注']
-    apply_header(ws1, headers1)
-
-    for row_idx, entry in enumerate(all_entries, 1):
-        seg_id = entry['seg_id']
-        count = entry['count']
-        is_skipped = (count == 0) or (seg_id == 0) or (seg_id not in valid_ids)
-        note = ''
-        if count == 0:
-            note = '无记录(count=0)'
-        elif seg_id == 0:
-            note = '段ID为0'
-        elif seg_id not in valid_ids:
-            note = '重复段ID'
-
-        values = [
-            row_idx,
-            '0x{:04X}'.format(seg_id),
-            '0x{:04X}'.format(entry['offset']),
-            count,
-            entry['record_size'],
-            entry['total_size'],
-            '是' if is_skipped else '否',
-            note,
-        ]
-        for col, v in enumerate(values, 1):
-            cell = ws1.cell(row=row_idx + 1, column=col, value=v)
-            cell.alignment = header_align
-            cell.border = thin_border
-            if is_skipped:
-                cell.fill = skip_fill
-
-    set_col_widths(ws1, [6, 16, 16, 10, 16, 16, 10, 20])
-    ws1.freeze_panes = 'A2'
-
-    ws2 = wb.create_sheet('数据明细')
-    headers2 = ['序号', '所属数据段ID', '数据段Offset', '记录序号',
-                '记录Offset', '结束Offset', '长度(字节)',
-                '记录内容(HEX)', '分组', '编号', '姓名', '坐标(X,Y)']
-    apply_header(ws2, headers2)
-
-    current_seg = None
-    for row_idx, rec in enumerate(all_records, 1):
-        is_new_seg = rec['seg_id'] != current_seg
-        current_seg = rec['seg_id']
-
-        is_last = False
-        if row_idx < len(all_records):
-            next_rec = all_records[row_idx]
-            if next_rec['seg_id'] != current_seg:
-                is_last = True
-        else:
-            is_last = True
-
-        values = [
-            row_idx - 1,
-            rec['seg_id'] if is_new_seg else '',
-            rec['seg_offset'] if is_new_seg else '',
-            rec['record_index'],
-            rec['record_offset'],
-            rec['end_offset'],
-            rec['length'],
-            rec['hex'],
-            rec['group'],
-            rec['num'],
-            rec['name'],
-            rec['coord'],
-        ]
-        for col, v in enumerate(values, 1):
-            cell = ws2.cell(row=row_idx + 1, column=col, value=v)
-            cell.alignment = cell_align
-            cell.border = thin_border
-            if is_new_seg:
-                cell.fill = seg_fill
-            elif is_last:
-                cell.fill = last_fill
-
-    set_col_widths(ws2, [6, 16, 16, 10, 14, 14, 12, 80, 8, 10, 12, 12])
-    ws2.freeze_panes = 'A2'
-
-    wb.save(output_path)
-
-
 # ── 主程序 ─────────────────────────────────────────────
 
 def process_file(file_path, ext):
-    base_name = os.path.splitext(os.path.basename(file_path))[0]
-
     with open(file_path, 'rb') as f:
         raw = f.read()
     decrypted = xor_decrypt(raw)
@@ -659,42 +435,24 @@ def process_file(file_path, ext):
         return None, None, None
 
     if ext == '.evt':
-        all_entries, valid_entries, all_instructions = parse_evt(decrypted)
-        output_name = '{}_指令解析.xlsx'.format(base_name)
-        save_evt_excel(all_entries, valid_entries, all_instructions, os.path.join(EXPORT_DIR, output_name))
-        return all_entries, valid_entries, all_instructions
+        return parse_evt(decrypted)
     elif ext == '.msg':
-        all_entries, valid_entries, all_instructions = parse_msg(decrypted)
-        output_name = '{}_对话解析.xlsx'.format(base_name)
-        save_msg_excel(all_entries, valid_entries, all_instructions, os.path.join(EXPORT_DIR, output_name))
-        return all_entries, valid_entries, all_instructions
+        return parse_msg(decrypted)
     elif ext == '.dat':
-        all_entries, valid_entries, all_records = parse_dat(decrypted)
-        output_name = '{}_数据解析.xlsx'.format(base_name)
-        save_dat_excel(all_entries, valid_entries, all_records, os.path.join(EXPORT_DIR, output_name))
-        return all_entries, valid_entries, all_records
+        return parse_dat(decrypted)
     return None, None, None
 
 
-def get_stage_name(evt_entries):
-    if not evt_entries:
-        return ''
-    for entry in evt_entries:
-        if entry.get('id') == 0x0442:
-            continue
-        if entry.get('count', 0) > 0:
-            return '0x{:04X}'.format(entry['id'])
-    return ''
-
-
-def save_mix_excel(stage_name, evt_data, msg_data, dat_data, output_path):
+def save_stage_excel(stage_name, evt_data, msg_data, dat_data, output_path):
     wb = Workbook()
-    ws = wb.active
-    ws.title = '整合数据'
-    headers = ['二级菜单Offset', '指令序号', '指令内容(HEX)', '具体指令', '指令作用', '指令内容']
-    apply_header(ws, headers)
-    set_col_widths(ws, [18, 10, 40, 14, 16, 30])
-    ws.freeze_panes = 'A2'
+
+    # ── Sheet 1: 整合表 ──
+    ws1 = wb.active
+    ws1.title = '整合表'
+    headers1 = ['二级菜单Offset', '指令序号', '指令内容(HEX)', '具体指令', '指令作用', '指令内容']
+    apply_header(ws1, headers1)
+    set_col_widths(ws1, [18, 10, 40, 14, 16, 30])
+    ws1.freeze_panes = 'A2'
 
     msg_lookup = []
     if msg_data and msg_data[2]:
@@ -711,8 +469,9 @@ def save_mix_excel(stage_name, evt_data, msg_data, dat_data, output_path):
         for rec in dat_data[2]:
             g = rec.get('group', '')
             n = rec.get('name', '')
+            c = rec.get('coord', '')
             if g and n:
-                dat_group_names.setdefault(g, []).append(n)
+                dat_group_names.setdefault(g, []).append((n, c))
 
     current_seg = None
     row_idx = 0
@@ -721,12 +480,28 @@ def save_mix_excel(stage_name, evt_data, msg_data, dat_data, output_path):
             row_idx += 1
             is_new_seg = inst['seg_offset'] != current_seg
             current_seg = inst['seg_offset']
-            prefix = get_instr_prefix(inst['hex']) if inst['hex'] != '[超出文件范围]' else ''
-            func = INSTR_FUNC_MAP.get(prefix, '') if prefix else ''
-            content = ''
-            if inst['hex'] != '[超出文件范围]':
+            is_first_seg = inst.get('is_first_seg', False)
+            if is_first_seg:
+                prefix = ''
+                func = ''
+                content = ''
+                if inst['hex'] != '[超出文件范围]':
+                    hex_bytes = inst['hex'].split(' ')
+                    if len(hex_bytes) >= 35 and int(hex_bytes[22], 16) == 0x00:
+                        x = struct.unpack_from('<H', bytes([int(hex_bytes[23], 16), int(hex_bytes[24], 16)]), 0)[0]
+                        y = struct.unpack_from('<H', bytes([int(hex_bytes[25], 16), int(hex_bytes[26], 16)]), 0)[0]
+                        jump_target = int(hex_bytes[30], 16)
+                        seg_id_str = ''
+                        if evt_data and evt_data[0] and jump_target < len(evt_data[0]):
+                            seg_id_str = '0x{:04X}'.format(evt_data[0][jump_target]['id'])
+                        content = '移动到（{}，{}）坐标时，跳转到{}指令组（{}）'.format(x, y, jump_target, seg_id_str)
+            else:
+                prefix = get_instr_prefix(inst['hex']) if inst['hex'] != '[超出文件范围]' else ''
+                func = INSTR_FUNC_MAP.get(prefix, '') if prefix else ''
+                content = ''
+            if not is_first_seg and inst['hex'] != '[超出文件范围]':
                 hex_bytes = inst['hex'].split(' ')
-                if prefix == '1400000014':
+                if prefix in ('1400000014', '1500000015'):
                     if len(hex_bytes) >= 12:
                         seg_idx = int(hex_bytes[10], 16)
                         dlg_idx = int(hex_bytes[11], 16)
@@ -750,7 +525,15 @@ def save_mix_excel(stage_name, evt_data, msg_data, dat_data, output_path):
                     if len(hex_bytes) > 5:
                         grp = '{:02X}'.format(int(hex_bytes[5], 16))
                         if grp in dat_group_names:
-                            content = '、'.join(dat_group_names[grp])
+                            parts = []
+                            for item in dat_group_names[grp]:
+                                name = item[0]
+                                coord = item[1]
+                                if coord:
+                                    parts.append('{}（{}）'.format(name, coord))
+                                else:
+                                    parts.append(name)
+                            content = '\n'.join(parts)
                 elif prefix == '1000000010':
                     if len(hex_bytes) >= 12:
                         jump_val = int(hex_bytes[11], 16)
@@ -765,6 +548,25 @@ def save_mix_excel(stage_name, evt_data, msg_data, dat_data, output_path):
                             name_bytes.append(b)
                         if name_bytes:
                             content = clean_text(bytes(name_bytes).decode('big5', errors='replace'))
+                elif prefix == '1200000012':
+                    if len(hex_bytes) >= 10:
+                        x = struct.unpack_from('<H', bytes([int(hex_bytes[6], 16), int(hex_bytes[7], 16)]), 0)[0]
+                        y = struct.unpack_from('<H', bytes([int(hex_bytes[8], 16), int(hex_bytes[9], 16)]), 0)[0]
+                        content = '（{}，{}）'.format(x, y)
+                elif prefix in ('1300000013', '1700000017'):
+                    if len(hex_bytes) >= 30:
+                        x = struct.unpack_from('<H', bytes([int(hex_bytes[26], 16), int(hex_bytes[27], 16)]), 0)[0]
+                        y = struct.unpack_from('<H', bytes([int(hex_bytes[28], 16), int(hex_bytes[29], 16)]), 0)[0]
+                        content = '（{}，{}）'.format(x, y)
+                elif prefix == '1D0000001D':
+                    pass
+                elif prefix == '0A0000000A':
+                    if len(hex_bytes) > 5:
+                        mode = hex_bytes[5]
+                        if mode == '00':
+                            content = '切换到战斗模式'
+                        elif mode == '01':
+                            content = '切换到RPG模式'
             values = [
                 inst['seg_offset'] if is_new_seg else '',
                 inst['inst_index'],
@@ -774,18 +576,279 @@ def save_mix_excel(stage_name, evt_data, msg_data, dat_data, output_path):
                 content,
             ]
             row_fill = None
-            if prefix and prefix in INSTR_COLOR_MAP:
+            if not is_first_seg and prefix and prefix in INSTR_COLOR_MAP:
                 row_fill = PatternFill(start_color=INSTR_COLOR_MAP[prefix],
                                        end_color=INSTR_COLOR_MAP[prefix],
                                        fill_type='solid')
             for col, v in enumerate(values, 1):
                 if isinstance(v, str):
                     v = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', v)
-                cell = ws.cell(row=row_idx + 1, column=col, value=v)
+                cell = ws1.cell(row=row_idx + 1, column=col, value=v)
                 cell.alignment = cell_align
                 cell.border = thin_border
                 if row_fill:
                     cell.fill = row_fill
+
+    # ── Sheet 2: 指令菜单 ──
+    if evt_data and evt_data[0] is not None:
+        ws2 = wb.create_sheet('指令菜单')
+        all_entries = evt_data[0]
+        valid_ids = {e['id'] for e in evt_data[1]} if evt_data[1] else set()
+        headers2 = ['序号', '一级指令段ID', '一级菜单Offset', '指令数量', '是否跳过', '备注']
+        apply_header(ws2, headers2)
+
+        for idx, entry in enumerate(all_entries):
+            seg_id = entry['id']
+            count = entry['count']
+            is_skipped = (count == 0) or (seg_id not in valid_ids)
+            note = ''
+            if count == 0:
+                note = '无指令(count=0)'
+            elif seg_id not in valid_ids:
+                note = '重复段ID'
+            elif seg_id == 0x0442:
+                note = '第一段（定长记录）'
+
+            values = [
+                idx,
+                '0x{:04X}'.format(seg_id),
+                '0x{:04X}'.format(entry['offset']),
+                count,
+                '是' if is_skipped else '否',
+                note,
+            ]
+            for col, v in enumerate(values, 1):
+                cell = ws2.cell(row=idx + 2, column=col, value=v)
+                cell.alignment = header_align
+                cell.border = thin_border
+                if is_skipped:
+                    cell.fill = skip_fill
+
+        set_col_widths(ws2, [6, 18, 18, 10, 10, 20])
+        ws2.freeze_panes = 'A2'
+
+    # ── Sheet 3: 指令解析 ──
+    if evt_data and evt_data[2] is not None:
+        ws3 = wb.create_sheet('指令解析')
+        all_instructions = evt_data[2]
+        headers3 = ['序号', '所属一级段ID', '二级菜单Offset', '指令序号',
+                    '指令Offset', '结束Offset', '长度(字节)', '指令内容(HEX)',
+                    '具体指令', '指令作用']
+        apply_header(ws3, headers3)
+
+        current_seg = None
+        for idx, inst in enumerate(all_instructions):
+            is_new_seg = inst['seg_id'] != current_seg
+            current_seg = inst['seg_id']
+
+            is_last = False
+            if idx + 1 < len(all_instructions):
+                next_inst = all_instructions[idx + 1]
+                if next_inst['seg_id'] != current_seg:
+                    is_last = True
+            else:
+                is_last = True
+
+            if inst.get('is_first_seg', False):
+                prefix = ''
+                func = ''
+            else:
+                prefix = get_instr_prefix(inst['hex']) if inst['hex'] != '[超出文件范围]' else ''
+                func = INSTR_FUNC_MAP.get(prefix, '') if prefix else ''
+
+            values = [
+                idx,
+                inst['seg_id'] if is_new_seg else '',
+                inst['seg_offset'] if is_new_seg else '',
+                inst['inst_index'],
+                inst['inst_offset'],
+                inst['end_offset'],
+                inst['length'],
+                inst['hex'],
+                prefix,
+                func,
+            ]
+            for col, v in enumerate(values, 1):
+                cell = ws3.cell(row=idx + 2, column=col, value=v)
+                cell.alignment = cell_align
+                cell.border = thin_border
+                if is_new_seg:
+                    cell.fill = seg_fill
+                elif is_last:
+                    cell.fill = last_fill
+
+        set_col_widths(ws3, [6, 16, 18, 10, 14, 14, 12, 80, 14, 16])
+        ws3.freeze_panes = 'A2'
+
+    # ── Sheet 4: 对话菜单 ──
+    if msg_data and msg_data[0] is not None:
+        ws4 = wb.create_sheet('对话菜单')
+        all_entries = msg_data[0]
+        valid_ids = {e['id'] for e in msg_data[1]} if msg_data[1] else set()
+        headers4 = ['序号', '一级指令段ID', '一级菜单Offset', '指令数量', '是否跳过', '备注']
+        apply_header(ws4, headers4)
+
+        for idx, entry in enumerate(all_entries):
+            seg_id = entry['id']
+            count = entry['count']
+            is_skipped = (count == 0) or (seg_id == 0) or (seg_id not in valid_ids)
+            note = ''
+            if count == 0:
+                note = '无指令(count=0)'
+            elif seg_id == 0:
+                note = '空段ID'
+            elif seg_id not in valid_ids:
+                note = '重复段ID'
+
+            values = [
+                idx,
+                '0x{:04X}'.format(seg_id),
+                '0x{:04X}'.format(entry['offset']),
+                count,
+                '是' if is_skipped else '否',
+                note,
+            ]
+            for col, v in enumerate(values, 1):
+                cell = ws4.cell(row=idx + 2, column=col, value=v)
+                cell.alignment = header_align
+                cell.border = thin_border
+                if is_skipped:
+                    cell.fill = skip_fill
+
+        set_col_widths(ws4, [6, 18, 18, 10, 10, 20])
+        ws4.freeze_panes = 'A2'
+
+    # ── Sheet 5: 对话解析 ──
+    if msg_data and msg_data[2] is not None:
+        ws5 = wb.create_sheet('对话解析')
+        all_instructions = msg_data[2]
+        headers5 = ['序号', '所属一级段ID', '二级菜单Offset', '指令序号',
+                    '指令Offset', '结束Offset', '长度(字节)', '指令内容(HEX)', '文字内容(Big5)']
+        apply_header(ws5, headers5)
+
+        current_seg = None
+        for idx, inst in enumerate(all_instructions):
+            is_new_seg = inst['seg_id'] != current_seg
+            current_seg = inst['seg_id']
+
+            is_last = False
+            if idx + 1 < len(all_instructions):
+                next_inst = all_instructions[idx + 1]
+                if next_inst['seg_id'] != current_seg:
+                    is_last = True
+            else:
+                is_last = True
+
+            values = [
+                idx,
+                inst['seg_id'] if is_new_seg else '',
+                inst['seg_offset'] if is_new_seg else '',
+                inst['inst_index'],
+                inst['inst_offset'],
+                inst['end_offset'],
+                inst['length'],
+                inst['hex'],
+                inst['text'],
+            ]
+            for col, v in enumerate(values, 1):
+                cell = ws5.cell(row=idx + 2, column=col, value=v)
+                cell.alignment = cell_align
+                cell.border = thin_border
+                if is_new_seg:
+                    cell.fill = seg_fill
+                elif is_last:
+                    cell.fill = last_fill
+
+        set_col_widths(ws5, [6, 16, 18, 10, 14, 14, 12, 60, 60])
+        ws5.freeze_panes = 'A2'
+
+    # ── Sheet 6: 数据菜单 ──
+    if dat_data and dat_data[0] is not None:
+        ws6 = wb.create_sheet('数据菜单')
+        all_entries = dat_data[0]
+        valid_ids = {e['seg_id'] for e in dat_data[1]} if dat_data[1] else set()
+        headers6 = ['序号', '数据段ID', '菜单Offset', '记录数', '记录大小(字节)', '总大小(字节)', '是否跳过', '备注']
+        apply_header(ws6, headers6)
+
+        for idx, entry in enumerate(all_entries):
+            seg_id = entry['seg_id']
+            count = entry['count']
+            is_skipped = (count == 0) or (seg_id == 0) or (seg_id not in valid_ids)
+            note = ''
+            if count == 0:
+                note = '无记录(count=0)'
+            elif seg_id == 0:
+                note = '段ID为0'
+            elif seg_id not in valid_ids:
+                note = '重复段ID'
+
+            values = [
+                idx,
+                '0x{:04X}'.format(seg_id),
+                '0x{:04X}'.format(entry['offset']),
+                count,
+                entry.get('record_size', 0),
+                entry.get('total_size', 0),
+                '是' if is_skipped else '否',
+                note,
+            ]
+            for col, v in enumerate(values, 1):
+                cell = ws6.cell(row=idx + 2, column=col, value=v)
+                cell.alignment = header_align
+                cell.border = thin_border
+                if is_skipped:
+                    cell.fill = skip_fill
+
+        set_col_widths(ws6, [6, 16, 16, 10, 16, 16, 10, 20])
+        ws6.freeze_panes = 'A2'
+
+    # ── Sheet 7: 数据解析 ──
+    if dat_data and dat_data[2] is not None:
+        ws7 = wb.create_sheet('数据解析')
+        all_records = dat_data[2]
+        headers7 = ['序号', '所属数据段ID', '数据段Offset', '记录序号',
+                    '记录Offset', '结束Offset', '长度(字节)',
+                    '记录内容(HEX)', '分组', '编号', '姓名', '坐标(X,Y)']
+        apply_header(ws7, headers7)
+
+        current_seg = None
+        for idx, rec in enumerate(all_records):
+            is_new_seg = rec['seg_id'] != current_seg
+            current_seg = rec['seg_id']
+
+            is_last = False
+            if idx + 1 < len(all_records):
+                next_rec = all_records[idx + 1]
+                if next_rec['seg_id'] != current_seg:
+                    is_last = True
+            else:
+                is_last = True
+
+            values = [
+                idx,
+                rec['seg_id'] if is_new_seg else '',
+                rec['seg_offset'] if is_new_seg else '',
+                rec['record_index'],
+                rec['record_offset'],
+                rec['end_offset'],
+                rec['length'],
+                rec['hex'],
+                rec['group'],
+                rec['num'],
+                rec['name'],
+                rec['coord'],
+            ]
+            for col, v in enumerate(values, 1):
+                cell = ws7.cell(row=idx + 2, column=col, value=v)
+                cell.alignment = cell_align
+                cell.border = thin_border
+                if is_new_seg:
+                    cell.fill = seg_fill
+                elif is_last:
+                    cell.fill = last_fill
+
+        set_col_widths(ws7, [6, 16, 16, 10, 14, 14, 12, 80, 8, 10, 12, 12])
+        ws7.freeze_panes = 'A2'
 
     wb.save(output_path)
 
@@ -832,23 +895,12 @@ def main():
         try:
             data = process_file(fp, ext)
             if data[0] is not None:
-                if ext == '.evt':
-                    count = len(data[2])
-                    parsed.setdefault(name, {})['.evt'] = data
-                elif ext == '.msg':
-                    count = len(data[2])
-                    parsed.setdefault(name, {})['.msg'] = data
-                elif ext == '.dat':
-                    count = len(data[2])
-                    parsed.setdefault(name, {})['.dat'] = data
+                parsed.setdefault(name, {})[ext] = data
                 label = {'.evt': '指令', '.msg': '对话', '.dat': '记录'}[ext]
+                count = len(data[2])
                 print('  [{}] {} -> {} 条{}'.format(ext.upper(), name, count, label))
         except Exception as e:
             print('  [{}] {} -> 错误: {}'.format(ext.upper(), name, e))
-
-    MIX_DIR = os.path.join(SCRIPT_DIR, 'mix')
-    if not os.path.exists(MIX_DIR):
-        os.makedirs(MIX_DIR)
 
     stage_groups = {}
     for fname, types in parsed.items():
@@ -860,14 +912,13 @@ def main():
         evt_data = types.get('.evt', (None, None, None))
         msg_data = types.get('.msg', (None, None, None))
         dat_data = types.get('.dat', (None, None, None))
-        mix_name = '{}_整合表.xlsx'.format(stage_name)
-        save_mix_excel(stage_name, evt_data, msg_data, dat_data, os.path.join(MIX_DIR, mix_name))
-        print('  [MIX] {} -> {}'.format(stage_name, mix_name))
+        output_name = '{}.xlsx'.format(stage_name)
+        save_stage_excel(stage_name, evt_data, msg_data, dat_data, os.path.join(EXPORT_DIR, output_name))
+        print('  [EXPORT] {} -> {}'.format(stage_name, output_name))
 
     print()
     print('完成! 所有 Excel 文件已保存到:')
     print('  export 文件夹: {}'.format(EXPORT_DIR))
-    print('  mix 文件夹:   {}'.format(MIX_DIR))
     print()
     try:
         input('按回车键退出...')
