@@ -365,6 +365,7 @@ def parse_dat(decrypted):
                 rec_num = ''
                 rec_name = ''
                 rec_coord = ''
+                rec_remark = ''
                 rec_bytes = b''
             else:
                 actual_end = min(end_off, len(decrypted))
@@ -379,8 +380,12 @@ def parse_dat(decrypted):
                     rec_num = ''
                     is_char_data = False
                 if is_char_data and len(rec_bytes) >= 12:
-                    name_bytes = rec_bytes[4:12].rstrip(b'\x00')
-                    rec_name = name_bytes.decode('big5', errors='replace')
+                    name_end = rec_bytes.find(b'\x00', 4)
+                    if name_end == -1 or name_end == 4:
+                        name_bytes = rec_bytes[4:12].rstrip(b'\x00')
+                    else:
+                        name_bytes = rec_bytes[4:name_end]
+                    rec_name = clean_text(name_bytes.decode('big5', errors='replace')) if name_bytes else ''
                 elif not is_char_data:
                     if all(b == 0 for b in rec_bytes):
                         rec_group = None
@@ -398,6 +403,10 @@ def parse_dat(decrypted):
                     rec_coord = '{}, {}'.format(rec_x, rec_y)
                 else:
                     rec_coord = ''
+                if is_char_data and len(rec_bytes) >= 30 and rec_bytes[29] != 0xFF:
+                    rec_remark = '击败后跳转第{}指令组'.format(rec_bytes[29])
+                else:
+                    rec_remark = ''
                 rec_len = len(rec_bytes)
                 rec_big5 = decode_big5(rec_bytes)
 
@@ -418,9 +427,94 @@ def parse_dat(decrypted):
                 'num': rec_num,
                 'name': rec_name,
                 'coord': rec_coord,
+                'remark': rec_remark,
             })
 
     return all_entries, valid_entries, all_records
+
+
+# ── SWL 解析（补充文件，定长记录结构）────────────────────
+
+def parse_swl(decrypted):
+    if len(decrypted) < 3 or decrypted[0:3] != b'SE3':
+        return None, None, None
+    entry_count = decrypted[10]
+    menu_start = 274
+
+    all_entries = []
+    for i in range(entry_count):
+        off = menu_start + i * 16
+        if off + 16 > len(decrypted):
+            break
+        seg_id = read_u32_le(decrypted, off)
+        count = read_u32_le(decrypted, off + 4)
+        record_size = read_u32_le(decrypted, off + 8)
+        total_size = read_u32_le(decrypted, off + 12)
+        all_entries.append({
+            'offset': off, 'id': seg_id, 'count': count,
+            'record_size': record_size, 'total_size': total_size,
+        })
+
+    all_seg_ids = sorted(set(e['id'] for e in all_entries if e['id'] != 0))
+
+    valid_entries = []
+    seen_ids = set()
+    for entry in all_entries:
+        if entry['count'] == 0:
+            continue
+        if entry['id'] in seen_ids:
+            continue
+        seen_ids.add(entry['id'])
+        valid_entries.append(entry)
+
+    all_instructions = []
+    for seg in valid_entries:
+        seg_id = seg['id']
+        count = seg['count']
+
+        idx_in_sorted = bisect.bisect_left(all_seg_ids, seg_id)
+        if idx_in_sorted + 1 < len(all_seg_ids):
+            next_seg_start = all_seg_ids[idx_in_sorted + 1]
+        else:
+            next_seg_start = len(decrypted)
+
+        record_size = seg.get('record_size', 0)
+        total_size = seg.get('total_size', 0)
+        if record_size == 0 and total_size > 0 and count > 0:
+            record_size = total_size // count
+        if count == 1 and record_size == 0:
+            record_size = total_size
+
+        menu_offset = seg_id
+        for i in range(count):
+            rec_off = seg_id + i * record_size
+            if i + 1 < count:
+                end_off = seg_id + (i + 1) * record_size
+            else:
+                end_off = min(seg_id + total_size, next_seg_start) if total_size > 0 else next_seg_start
+
+            if rec_off >= len(decrypted):
+                inst_hex = '[超出文件范围]'
+                inst_len = 0
+            else:
+                actual_end = min(end_off, len(decrypted))
+                inst_bytes = decrypted[rec_off:actual_end]
+                if all(b == 0 for b in inst_bytes):
+                    continue
+                inst_hex = ' '.join('{:02X}'.format(b) for b in inst_bytes)
+                inst_len = len(inst_bytes)
+
+            all_instructions.append({
+                'seg_id': '0x{:04X}'.format(seg_id),
+                'seg_offset': '0x{:04X}'.format(menu_offset),
+                'inst_index': i,
+                'inst_offset': '0x{:04X}'.format(rec_off),
+                'end_offset': '0x{:04X}'.format(end_off),
+                'length': inst_len,
+                'hex': inst_hex,
+            })
+
+    return all_entries, valid_entries, all_instructions
 
 
 # ── 主程序 ─────────────────────────────────────────────
@@ -428,6 +522,7 @@ def parse_dat(decrypted):
 def process_file(file_path, ext):
     with open(file_path, 'rb') as f:
         raw = f.read()
+
     decrypted = xor_decrypt(raw)
 
     if len(decrypted) < 3 or decrypted[0:3] != b'SE3':
@@ -440,10 +535,12 @@ def process_file(file_path, ext):
         return parse_msg(decrypted)
     elif ext == '.dat':
         return parse_dat(decrypted)
+    elif ext == '.swl':
+        return parse_swl(decrypted)
     return None, None, None
 
 
-def save_stage_excel(stage_name, evt_data, msg_data, dat_data, output_path):
+def save_stage_excel(stage_name, evt_data, msg_data, dat_data, swl_data, output_path):
     wb = Workbook()
 
     # ── Sheet 1: 整合表 ──
@@ -487,14 +584,37 @@ def save_stage_excel(stage_name, evt_data, msg_data, dat_data, output_path):
                 content = ''
                 if inst['hex'] != '[超出文件范围]':
                     hex_bytes = inst['hex'].split(' ')
-                    if len(hex_bytes) >= 35 and int(hex_bytes[22], 16) == 0x00:
+                    if len(hex_bytes) >= 31:
+                        byte22 = int(hex_bytes[22], 16)
                         x = struct.unpack_from('<H', bytes([int(hex_bytes[23], 16), int(hex_bytes[24], 16)]), 0)[0]
                         y = struct.unpack_from('<H', bytes([int(hex_bytes[25], 16), int(hex_bytes[26], 16)]), 0)[0]
-                        jump_target = int(hex_bytes[30], 16)
-                        seg_id_str = ''
-                        if evt_data and evt_data[0] and jump_target < len(evt_data[0]):
-                            seg_id_str = '0x{:04X}'.format(evt_data[0][jump_target]['id'])
-                        content = '移动到（{}，{}）坐标时，跳转到{}指令组（{}）'.format(x, y, jump_target, seg_id_str)
+                        byte29 = int(hex_bytes[29], 16)
+                        byte30 = int(hex_bytes[30], 16)
+
+                        if byte22 == 0x00:
+                            if byte29 == 0x01:
+                                type_str = '关卡切换坐标'
+                            elif byte29 == 0x00:
+                                type_str = '战场事件坐标'
+                            else:
+                                type_str = '未知坐标'
+                        elif byte22 == 0x01:
+                            if byte30 != 0xFF:
+                                type_str = '特殊事件坐标'
+                            else:
+                                if byte29 == 0x00:
+                                    type_str = '战场隐藏道具坐标'
+                                else:
+                                    type_str = '普通可见道具坐标'
+                        else:
+                            type_str = '未知坐标'
+
+                        content = '{}（{}，{}）'.format(type_str, x, y)
+                        if byte30 != 0xFF:
+                            seg_id_str = ''
+                            if evt_data and evt_data[0] and byte30 < len(evt_data[0]):
+                                seg_id_str = '0x{:04X}'.format(evt_data[0][byte30]['id'])
+                            content += '，跳转到{}指令组（{}）'.format(byte30, seg_id_str)
             else:
                 prefix = get_instr_prefix(inst['hex']) if inst['hex'] != '[超出文件范围]' else ''
                 func = INSTR_FUNC_MAP.get(prefix, '') if prefix else ''
@@ -511,10 +631,22 @@ def save_stage_excel(stage_name, evt_data, msg_data, dat_data, output_path):
                     if len(hex_bytes) >= 17:
                         jump_val = struct.unpack_from('<I', bytes([int(h, 16) for h in hex_bytes[13:17]]), 0)[0]
                         content = '跳转至{}指令'.format(jump_val)
+                elif prefix == '0600000006':
+                    name_bytes = []
+                    for h in hex_bytes[6:]:
+                        b = int(h, 16)
+                        if b == 0:
+                            break
+                        name_bytes.append(b)
+                    name = clean_text(bytes(name_bytes).decode('big5', errors='replace')) if name_bytes else ''
+                    content = name
                 elif prefix == '0C0000000C':
                     if len(hex_bytes) > 5:
+                        start_idx = 5
+                        if int(hex_bytes[5], 16) == 0 and len(hex_bytes) > 6:
+                            start_idx = 6
                         name_bytes = []
-                        for h in hex_bytes[5:]:
+                        for h in hex_bytes[start_idx:]:
                             b = int(h, 16)
                             if b == 0:
                                 break
@@ -534,6 +666,12 @@ def save_stage_excel(stage_name, evt_data, msg_data, dat_data, output_path):
                                 else:
                                     parts.append(name)
                             content = '\n'.join(parts)
+                elif prefix == '1600000016':
+                    if len(hex_bytes) > 5:
+                        grp = '{:02X}'.format(int(hex_bytes[5], 16))
+                        if grp in dat_group_names:
+                            names = [item[0] for item in dat_group_names[grp]]
+                            content = '\n'.join(names)
                 elif prefix == '1000000010':
                     if len(hex_bytes) >= 12:
                         jump_val = int(hex_bytes[11], 16)
@@ -548,16 +686,43 @@ def save_stage_excel(stage_name, evt_data, msg_data, dat_data, output_path):
                             name_bytes.append(b)
                         if name_bytes:
                             content = clean_text(bytes(name_bytes).decode('big5', errors='replace'))
+                elif prefix == '1F0000001F':
+                    if len(hex_bytes) >= 8:
+                        mode = int(hex_bytes[5], 16)
+                        music_id = int(hex_bytes[6], 16)
+                        action = '开始播放' if mode == 0 else '停止播放'
+                        content = '{}音乐{}.mp3'.format(action, music_id)
                 elif prefix == '1200000012':
                     if len(hex_bytes) >= 10:
                         x = struct.unpack_from('<H', bytes([int(hex_bytes[6], 16), int(hex_bytes[7], 16)]), 0)[0]
                         y = struct.unpack_from('<H', bytes([int(hex_bytes[8], 16), int(hex_bytes[9], 16)]), 0)[0]
                         content = '（{}，{}）'.format(x, y)
-                elif prefix in ('1300000013', '1700000017'):
+                elif prefix == '1300000013':
                     if len(hex_bytes) >= 30:
                         x = struct.unpack_from('<H', bytes([int(hex_bytes[26], 16), int(hex_bytes[27], 16)]), 0)[0]
                         y = struct.unpack_from('<H', bytes([int(hex_bytes[28], 16), int(hex_bytes[29], 16)]), 0)[0]
-                        content = '（{}，{}）'.format(x, y)
+                        name_start = 6 if int(hex_bytes[5], 16) == 0 else 5
+                        name_bytes = []
+                        for h in hex_bytes[name_start:]:
+                            b = int(h, 16)
+                            if b == 0:
+                                break
+                            name_bytes.append(b)
+                        name = clean_text(bytes(name_bytes).decode('big5', errors='replace')) if name_bytes else ''
+                        content = '{}移动到坐标 ({}, {})'.format(name, x, y)
+                elif prefix == '1700000017':
+                    if len(hex_bytes) >= 30:
+                        x = struct.unpack_from('<H', bytes([int(hex_bytes[26], 16), int(hex_bytes[27], 16)]), 0)[0]
+                        y = struct.unpack_from('<H', bytes([int(hex_bytes[28], 16), int(hex_bytes[29], 16)]), 0)[0]
+                        name_start = 6 if int(hex_bytes[5], 16) == 0 else 5
+                        name_bytes = []
+                        for h in hex_bytes[name_start:]:
+                            b = int(h, 16)
+                            if b == 0:
+                                break
+                            name_bytes.append(b)
+                        name = clean_text(bytes(name_bytes).decode('big5', errors='replace')) if name_bytes else ''
+                        content = '{}移动到坐标 ({}, {})'.format(name, x, y)
                 elif prefix == '1D0000001D':
                     pass
                 elif prefix == '0A0000000A':
@@ -567,6 +732,99 @@ def save_stage_excel(stage_name, evt_data, msg_data, dat_data, output_path):
                             content = '切换到战斗模式'
                         elif mode == '01':
                             content = '切换到RPG模式'
+                elif prefix == '1B0000001B':
+                    if len(hex_bytes) > 6:
+                        ascii_bytes = []
+                        for h in hex_bytes[6:]:
+                            b = int(h, 16)
+                            if b == 0:
+                                break
+                            ascii_bytes.append(b)
+                        filename = bytes(ascii_bytes).decode('ascii', errors='replace') if ascii_bytes else ''
+                        big5_start = 6 + len(ascii_bytes) + 1
+                        while big5_start < len(hex_bytes) and int(hex_bytes[big5_start], 16) == 0:
+                            big5_start += 1
+                        big5_bytes = []
+                        for h in hex_bytes[big5_start:]:
+                            b = int(h, 16)
+                            if b == 0:
+                                break
+                            big5_bytes.append(b)
+                        big5_text = clean_text(bytes(big5_bytes).decode('big5', errors='replace')) if big5_bytes else ''
+                        if filename and big5_text:
+                            content = '{}（{}）'.format(big5_text, filename)
+                        elif filename:
+                            content = filename
+                        elif big5_text:
+                            content = big5_text
+                elif prefix == '2B0000002B':
+                    if len(hex_bytes) >= 9:
+                        x = int(hex_bytes[5], 16)
+                        y = int(hex_bytes[7], 16)
+                        content = '坐标（{}，{}）'.format(x, y)
+                elif prefix == '2E0000002E':
+                    if len(hex_bytes) >= 30:
+                        name_start = 6 if int(hex_bytes[5], 16) == 0 else 5
+                        name_bytes = []
+                        for h in hex_bytes[name_start:]:
+                            b = int(h, 16)
+                            if b == 0:
+                                break
+                            name_bytes.append(b)
+                        name = clean_text(bytes(name_bytes).decode('big5', errors='replace')) if name_bytes else ''
+                        x = struct.unpack_from('<H', bytes([int(hex_bytes[26], 16), int(hex_bytes[27], 16)]), 0)[0]
+                        y = struct.unpack_from('<H', bytes([int(hex_bytes[28], 16), int(hex_bytes[29], 16)]), 0)[0]
+                        content = '{}（{}，{}）'.format(name, x, y)
+                elif prefix == '0D0000000D':
+                    if len(hex_bytes) >= 26:
+                        name_bytes = []
+                        for h in hex_bytes[5:]:
+                            b = int(h, 16)
+                            if b == 0:
+                                break
+                            name_bytes.append(b)
+                        level_name = clean_text(bytes(name_bytes).decode('big5', errors='replace'))
+                        jump_target = int(hex_bytes[25], 16)
+                        content = '跳转到{}关卡执行第{}组指令'.format(level_name, jump_target)
+                elif prefix == '2200000022':
+                    name_bytes = []
+                    for h in hex_bytes[6:]:
+                        b = int(h, 16)
+                        if b == 0:
+                            break
+                        name_bytes.append(b)
+                    name = clean_text(bytes(name_bytes).decode('big5', errors='replace')) if name_bytes else ''
+                    content = name
+                elif prefix == '3A0000003A':
+                    name_bytes = []
+                    for h in hex_bytes[5:]:
+                        b = int(h, 16)
+                        if b == 0:
+                            break
+                        name_bytes.append(b)
+                    name = clean_text(bytes(name_bytes).decode('big5', errors='replace')) if name_bytes else ''
+                    content = name
+                elif prefix == '3900000039':
+                    name_bytes = []
+                    for h in hex_bytes[6:]:
+                        b = int(h, 16)
+                        if b == 0:
+                            break
+                        name_bytes.append(b)
+                    name = clean_text(bytes(name_bytes).decode('big5', errors='replace')) if name_bytes else ''
+                    content = name
+                elif prefix == '2000000020':
+                    if len(hex_bytes) >= 11:
+                        b5 = hex_bytes[5]
+                        jump_target = int(hex_bytes[10], 16)
+                        if b5 == '01':
+                            content = '倒计时停止'
+                        else:
+                            seg_id_str = ''
+                            if evt_data and evt_data[0] and jump_target < len(evt_data[0]):
+                                seg_id_str = '0x{:04X}'.format(evt_data[0][jump_target]['id'])
+                            mode = '显式开始' if b5 == '00' else '隐式开始'
+                            content = '{}，倒计时结束触发{}指令组（{}）'.format(mode, jump_target, seg_id_str)
             values = [
                 inst['seg_offset'] if is_new_seg else '',
                 inst['inst_index'],
@@ -594,8 +852,15 @@ def save_stage_excel(stage_name, evt_data, msg_data, dat_data, output_path):
         ws2 = wb.create_sheet('指令菜单')
         all_entries = evt_data[0]
         valid_ids = {e['id'] for e in evt_data[1]} if evt_data[1] else set()
-        headers2 = ['序号', '一级指令段ID', '一级菜单Offset', '指令数量', '是否跳过', '备注']
+        headers2 = ['序号', '一级指令段ID', '一级菜单Offset', '指令数量', '是否跳过', '作用', '备注']
         apply_header(ws2, headers2)
+
+        SEG_ROLES = {
+            0: '绑定坐标事件和道具',
+            1: '主脚本',
+            5: '战斗结束后脚本',
+            6: 'GAME OVER事件',
+        }
 
         for idx, entry in enumerate(all_entries):
             seg_id = entry['id']
@@ -609,12 +874,15 @@ def save_stage_excel(stage_name, evt_data, msg_data, dat_data, output_path):
             elif seg_id == 0x0442:
                 note = '第一段（定长记录）'
 
+            role = SEG_ROLES.get(idx, '')
+
             values = [
                 idx,
                 '0x{:04X}'.format(seg_id),
                 '0x{:04X}'.format(entry['offset']),
                 count,
                 '是' if is_skipped else '否',
+                role,
                 note,
             ]
             for col, v in enumerate(values, 1):
@@ -624,7 +892,7 @@ def save_stage_excel(stage_name, evt_data, msg_data, dat_data, output_path):
                 if is_skipped:
                     cell.fill = skip_fill
 
-        set_col_widths(ws2, [6, 18, 18, 10, 10, 20])
+        set_col_widths(ws2, [6, 18, 18, 10, 10, 18, 20])
         ws2.freeze_panes = 'A2'
 
     # ── Sheet 3: 指令解析 ──
@@ -727,20 +995,17 @@ def save_stage_excel(stage_name, evt_data, msg_data, dat_data, output_path):
         apply_header(ws5, headers5)
 
         current_seg = None
-        for idx, inst in enumerate(all_instructions):
+        row_idx = 0
+        for inst in all_instructions:
+            if inst['length'] == 0:
+                continue
             is_new_seg = inst['seg_id'] != current_seg
             current_seg = inst['seg_id']
 
             is_last = False
-            if idx + 1 < len(all_instructions):
-                next_inst = all_instructions[idx + 1]
-                if next_inst['seg_id'] != current_seg:
-                    is_last = True
-            else:
-                is_last = True
 
             values = [
-                idx,
+                row_idx,
                 inst['seg_id'] if is_new_seg else '',
                 inst['seg_offset'] if is_new_seg else '',
                 inst['inst_index'],
@@ -751,13 +1016,12 @@ def save_stage_excel(stage_name, evt_data, msg_data, dat_data, output_path):
                 inst['text'],
             ]
             for col, v in enumerate(values, 1):
-                cell = ws5.cell(row=idx + 2, column=col, value=v)
+                cell = ws5.cell(row=row_idx + 2, column=col, value=v)
                 cell.alignment = cell_align
                 cell.border = thin_border
                 if is_new_seg:
                     cell.fill = seg_fill
-                elif is_last:
-                    cell.fill = last_fill
+            row_idx += 1
 
         set_col_widths(ws5, [6, 16, 18, 10, 14, 14, 12, 60, 60])
         ws5.freeze_panes = 'A2'
@@ -808,21 +1072,13 @@ def save_stage_excel(stage_name, evt_data, msg_data, dat_data, output_path):
         all_records = dat_data[2]
         headers7 = ['序号', '所属数据段ID', '数据段Offset', '记录序号',
                     '记录Offset', '结束Offset', '长度(字节)',
-                    '记录内容(HEX)', '分组', '编号', '姓名', '坐标(X,Y)']
+                    '记录内容(HEX)', '分组', '编号', '姓名', '坐标(X,Y)', '备注']
         apply_header(ws7, headers7)
 
         current_seg = None
         for idx, rec in enumerate(all_records):
             is_new_seg = rec['seg_id'] != current_seg
             current_seg = rec['seg_id']
-
-            is_last = False
-            if idx + 1 < len(all_records):
-                next_rec = all_records[idx + 1]
-                if next_rec['seg_id'] != current_seg:
-                    is_last = True
-            else:
-                is_last = True
 
             values = [
                 idx,
@@ -837,6 +1093,7 @@ def save_stage_excel(stage_name, evt_data, msg_data, dat_data, output_path):
                 rec['num'],
                 rec['name'],
                 rec['coord'],
+                rec.get('remark', ''),
             ]
             for col, v in enumerate(values, 1):
                 cell = ws7.cell(row=idx + 2, column=col, value=v)
@@ -844,19 +1101,127 @@ def save_stage_excel(stage_name, evt_data, msg_data, dat_data, output_path):
                 cell.border = thin_border
                 if is_new_seg:
                     cell.fill = seg_fill
-                elif is_last:
-                    cell.fill = last_fill
 
-        set_col_widths(ws7, [6, 16, 16, 10, 14, 14, 12, 80, 8, 10, 12, 12])
+        set_col_widths(ws7, [6, 16, 16, 10, 14, 14, 12, 80, 8, 10, 12, 12, 24])
         ws7.freeze_panes = 'A2'
 
-    wb.save(output_path)
+    # ── Sheet 8: 补充菜单 ──
+    if swl_data and swl_data[0] is not None:
+        ws8 = wb.create_sheet('补充菜单')
+        all_entries = swl_data[0]
+        valid_ids = {e['id'] for e in swl_data[1]} if swl_data[1] else set()
+        headers8 = ['序号', '补充指令段ID', '菜单Offset', '指令数量', '是否跳过', '备注']
+        apply_header(ws8, headers8)
+
+        for idx, entry in enumerate(all_entries):
+            seg_id = entry['id']
+            count = entry['count']
+            is_skipped = (count == 0) or (seg_id not in valid_ids)
+            note = ''
+            if count == 0:
+                note = '无指令(count=0)'
+            elif seg_id not in valid_ids:
+                note = '重复段ID'
+
+            values = [
+                idx,
+                '0x{:04X}'.format(seg_id),
+                '0x{:04X}'.format(entry['offset']),
+                count,
+                '是' if is_skipped else '否',
+                note,
+            ]
+            for col, v in enumerate(values, 1):
+                cell = ws8.cell(row=idx + 2, column=col, value=v)
+                cell.alignment = header_align
+                cell.border = thin_border
+                if is_skipped:
+                    cell.fill = skip_fill
+
+        set_col_widths(ws8, [6, 18, 18, 10, 10, 20])
+        ws8.freeze_panes = 'A2'
+
+    # ── Sheet 9: 补充解析 ──
+    if swl_data and swl_data[2] is not None:
+        ws9 = wb.create_sheet('补充解析')
+        all_instructions = swl_data[2]
+        headers9 = ['序号', '所属补充段ID', '二级菜单Offset', '指令序号',
+                    '指令Offset', '结束Offset', '长度(字节)', '指令内容(HEX)',
+                    '指令内容']
+        apply_header(ws9, headers9)
+
+        current_seg = None
+        for idx, inst in enumerate(all_instructions):
+            is_new_seg = inst['seg_id'] != current_seg
+            current_seg = inst['seg_id']
+
+            content = ''
+            if inst['hex'] != '[超出文件范围]':
+                hex_bytes = inst['hex'].split(' ')
+                if len(hex_bytes) >= 23:
+                    byte14 = int(hex_bytes[14], 16)
+                    x = struct.unpack_from('<H', bytes([int(hex_bytes[15], 16), int(hex_bytes[16], 16)]), 0)[0]
+                    y = struct.unpack_from('<H', bytes([int(hex_bytes[17], 16), int(hex_bytes[18], 16)]), 0)[0]
+                    byte21 = int(hex_bytes[21], 16)
+                    byte22 = int(hex_bytes[22], 16)
+
+                    if byte14 == 0x00:
+                        if byte21 == 0x01:
+                            type_str = '关卡切换坐标'
+                        elif byte21 == 0x00:
+                            type_str = '战场事件坐标'
+                        else:
+                            type_str = '未知坐标'
+                    elif byte14 == 0x01:
+                        if byte22 != 0xFF:
+                            type_str = '特殊事件坐标'
+                        else:
+                            if byte21 == 0x00:
+                                type_str = '战场隐藏道具坐标'
+                            else:
+                                type_str = '普通可见道具坐标'
+                    else:
+                        type_str = '未知坐标'
+
+                    content = '{}（{}，{}）'.format(type_str, x, y)
+                    if byte22 != 0xFF:
+                        seg_id_str = ''
+                        if evt_data and evt_data[0] and byte22 < len(evt_data[0]):
+                            seg_id_str = '0x{:04X}'.format(evt_data[0][byte22]['id'])
+                        content += '，跳转到{}指令组（{}）'.format(byte22, seg_id_str)
+
+            values = [
+                idx,
+                inst['seg_id'] if is_new_seg else '',
+                inst['seg_offset'] if is_new_seg else '',
+                inst['inst_index'],
+                inst['inst_offset'],
+                inst['end_offset'],
+                inst['length'],
+                inst['hex'],
+                content,
+            ]
+            for col, v in enumerate(values, 1):
+                cell = ws9.cell(row=idx + 2, column=col, value=v)
+                cell.alignment = cell_align
+                cell.border = thin_border
+                if is_new_seg:
+                    cell.fill = seg_fill
+
+        set_col_widths(ws9, [6, 16, 18, 10, 14, 14, 12, 80, 30])
+        ws9.freeze_panes = 'A2'
+
+    try:
+        wb.save(output_path)
+    except PermissionError:
+        print('  [跳过] 文件被占用，无法写入 - {}'.format(os.path.basename(output_path)))
+        return
 
 
 def main():
     os.chdir(SCRIPT_DIR)
     print('=' * 50)
-    print('  致命武力2脚本批量解析工具 (EVT / MSG / DAT)')
+    print('  致命武力2脚本批量解析工具 (EVT / MSG / DAT / SWL)')
     print('=' * 50)
     print()
 
@@ -877,11 +1242,11 @@ def main():
     files = []
     for f in sorted(os.listdir(folder)):
         ext = os.path.splitext(f)[1].lower()
-        if ext in ('.evt', '.msg', '.dat'):
+        if ext in ('.evt', '.msg', '.dat', '.swl'):
             files.append((os.path.join(folder, f), ext))
 
     if not files:
-        print('文件夹中没有 .evt / .msg / .dat 文件。')
+        print('文件夹中没有 .evt / .msg / .dat / .swl 文件。')
         return
 
     print('找到 {} 个文件:'.format(len(files)))
@@ -896,7 +1261,7 @@ def main():
             data = process_file(fp, ext)
             if data[0] is not None:
                 parsed.setdefault(name, {})[ext] = data
-                label = {'.evt': '指令', '.msg': '对话', '.dat': '记录'}[ext]
+                label = {'.evt': '指令', '.msg': '对话', '.dat': '记录', '.swl': '补充'}[ext]
                 count = len(data[2])
                 print('  [{}] {} -> {} 条{}'.format(ext.upper(), name, count, label))
         except Exception as e:
@@ -912,8 +1277,9 @@ def main():
         evt_data = types.get('.evt', (None, None, None))
         msg_data = types.get('.msg', (None, None, None))
         dat_data = types.get('.dat', (None, None, None))
+        swl_data = types.get('.swl', (None, None, None))
         output_name = '{}.xlsx'.format(stage_name)
-        save_stage_excel(stage_name, evt_data, msg_data, dat_data, os.path.join(EXPORT_DIR, output_name))
+        save_stage_excel(stage_name, evt_data, msg_data, dat_data, swl_data, os.path.join(EXPORT_DIR, output_name))
         print('  [EXPORT] {} -> {}'.format(stage_name, output_name))
 
     print()
