@@ -860,6 +860,7 @@ def save_stage_excel(stage_name, evt_data, msg_data, dat_data, swl_data, output_
             1: '主脚本',
             5: '战斗结束后脚本',
             6: 'GAME OVER事件',
+            11: '每击杀一名敌人调用一次',
         }
 
         for idx, entry in enumerate(all_entries):
